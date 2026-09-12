@@ -3,11 +3,6 @@ name: Fork Sync
 permissions:
     contents: write
 
-on:
-    schedule:
-        - cron: "0 0 * * *"  # 每天午夜执行
-    workflow_dispatch:  # 允许手动触发
-
 jobs:
     sync_with_upstream:
         name: Sync with Upstream
