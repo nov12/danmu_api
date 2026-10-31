@@ -18,6 +18,15 @@ const UI_THEMES = {
 const UI_THEME_STORAGE_KEY = 'logvar_ui_theme';
 const UI_SCHEME_STORAGE_KEY = 'logvar_ui_color_scheme';
 
+// 系统管理接口需要 ADMIN_TOKEN：命中 401 时给出统一提示，避免被当成普通失败反复重试
+function isAdminAuthError(status, result) {
+    return status === 401 || (result && result.errorCode === 401);
+}
+
+function alertAdminTokenRequired() {
+    customAlert('系统管理接口需要有效的 ADMIN_TOKEN。\\n\\n请先在服务端配置 ADMIN_TOKEN，再通过 /{ADMIN_TOKEN}/ 访问本页后重试。');
+}
+
 function getStoredTheme() {
     try {
         const theme = String(localStorage.getItem(UI_THEME_STORAGE_KEY) || '').toLowerCase();
@@ -43,6 +52,7 @@ function applyTheme(theme) {
     const normalizedTheme = String(theme || '').toLowerCase();
     const selectedTheme = Object.prototype.hasOwnProperty.call(UI_THEMES, normalizedTheme) ? normalizedTheme : 'lavender';
     document.body.dataset.theme = selectedTheme;
+    document.documentElement.dataset.theme = selectedTheme;
 
     document.querySelectorAll('[data-theme-option]').forEach(button => {
         const isSelected = button.dataset.themeOption === selectedTheme;
@@ -84,7 +94,8 @@ async function selectTheme(theme) {
     }
 }
 
-applyTheme(getStoredTheme() || document.body.dataset.theme || 'lavender');
+const initialTheme = getStoredTheme() || document.body.dataset.theme;
+if (initialTheme) applyTheme(initialTheme);
 
 // 导出当前管理员可见的环境变量配置
 async function exportSystemConfig() {
@@ -209,15 +220,21 @@ function normalizeImportedConfig(data) {
 }
 
 async function saveImportedConfigValue(key, value) {
-    const request = (endpoint) => fetch(buildApiUrl(endpoint), {
+    // 系统管理接口必须携带 ADMIN_TOKEN（buildApiUrl 第二参数为 true）
+    const request = (endpoint) => fetch(buildApiUrl(endpoint, true), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, value })
-    }).then(response => response.json());
+    }).then(async response => ({ status: response.status, result: await response.json() }));
 
-    let result = await request('/api/env/set');
+    let { status, result } = await request('/api/env/set');
+    if (isAdminAuthError(status, result)) {
+        const hint = result?.errorMessage || '需要有效的 ADMIN_TOKEN';
+        result = { ...result, success: false, message: hint, errorMessage: hint };
+        return result;
+    }
     if (!result.success) {
-        result = await request('/api/env/add');
+        ({ result } = await request('/api/env/add'));
     }
     return result;
 }
@@ -374,6 +391,10 @@ async function confirmClearCache() {
             updateLoadingText('清理完成', '缓存已成功清除');
             addLog('缓存清理完成', 'success');
             addLog('✅ 缓存清理成功！已清理: ' + JSON.stringify(result.clearedItems), 'success');
+            if (result.restartRequired) {
+                addLog(result.message, 'warn');
+                customAlert(result.message);
+            }
         } else {
             updateLoadingText('清理失败', '请查看日志了解详情');
             addLog('缓存清理失败: ' + result.message, 'error');
@@ -841,10 +862,10 @@ function renderValueInput(item) {
                 \${shouldShowMergeMode ? \`
                 <div class="merge-mode-controls">
                     <div class="merge-mode-btn" id="merge-mode-toggle" onclick="toggleMergeMode()">
-                        \${uiIcon('link')} 开启合并模式
+                        \${uiIcon('link')} 合并模式
                     </div>
                     <div class="form-help" style="margin: 0; margin-left: 10px;">
-                        开启后点击下方选项将添加到暂存区,组合后点击 √ 确认
+                        点击开启/关闭，在暂存区组合后添加。
                     </div>
                 </div>
 
@@ -867,14 +888,10 @@ function renderValueInput(item) {
             </div>
 
             \${currentKey === 'MERGE_SOURCE_PAIRS' ? \`
-            <div style="margin-top: 15px; margin-bottom: 8px;">
-                <button type="button" class="btn btn-primary btn-sm" onclick="fetchAndShowRecentData()">
-                    \${uiIcon('bar-chart')} 查看最近数据
-                </button>
+            <div style="margin-top: 8px; display: flex; justify-content: flex-end;">
+                \${renderRecentDataButton()}
             </div>
-            <div id="recent-data-panel" class="recent-data-panel">
-                <div id="recent-data-list"></div>
-            </div>
+            \${renderRecentDataPanel()}
             \` : ''}
         \`;
 
@@ -897,7 +914,7 @@ function renderValueInput(item) {
         container.innerHTML = \`
             <label>映射配置</label>
             <textarea id="map-bulk-value" rows="6" placeholder="原值->映射值;原值2->映射值2">\${escapeHtml(value || '')}</textarea>
-            <button type="button" class="btn btn-secondary" onclick="parseBulkMapItems()">解析并更新列表</button>
+            <button type="button" class="btn btn-secondary" onclick="parseBulkMapItems()">\${uiIcon('refresh-cw')} 解析并更新列表</button>
             <div class="map-container" id="map-container">
                 \${mapItems.map((item, index) => \`
                     <div class="map-item" data-index="\${index}">
@@ -914,15 +931,11 @@ function renderValueInput(item) {
                     <button type="button" class="btn btn-danger map-remove-btn" onclick="removeMapItem(this)">删除</button>
                 </div>
             </div>
-            <div style="display: flex; align-items: center; justify-content: space-between;">
-                <button type="button" class="btn btn-primary" onclick="addMapItem()">添加映射项</button>
-                <button type="button" class="btn btn-primary btn-sm" onclick="fetchAndShowRecentData()">
-                    \${uiIcon('bar-chart')} 查看最近数据
-                </button>
+            <div style="margin-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                <button type="button" class="btn btn-primary" onclick="addMapItem()">\${uiIcon('plus')} 添加映射项</button>
+                \${renderRecentDataButton('btn btn-primary')}
             </div>
-            <div id="recent-data-panel" class="recent-data-panel">
-                <div id="recent-data-list"></div>
-            </div>
+            \${renderRecentDataPanel()}
         \`;
 
         bindMapInputSync();
@@ -932,10 +945,13 @@ function renderValueInput(item) {
         const currentKey = editingKeyName;
         const isBilibiliCookie = currentKey === 'BILIBILI_COOKIE';
         const isAiApiKey = currentKey === 'AI_API_KEY';
+        const isDandanplayPassword = currentKey === 'DANDANPLAY_PASSWORD';
         const isColorPool = currentKey === 'COLOR_POOL';
         const isDanmuOffset = currentKey === 'DANMU_OFFSET';
 		const isCustomMergeRules = currentKey === 'CUSTOM_MERGE_RULES';
         const offsetSources = item && item.sources ? item.sources : [];
+        const isTitleFilter = currentKey === 'ANIME_TITLE_FILTER' || currentKey === 'EPISODE_TITLE_FILTER' || currentKey === 'TITLE_NOISE_FILTER';
+        const recentDataBlock = isTitleFilter ? \`<div style="margin-top: 8px; display: flex; justify-content: flex-end;">\${renderRecentDataButton()}</div>\${renderRecentDataPanel()}\` : '';
 
         if (isColorPool) {
             // 自定义颜色池专用编辑界面
@@ -980,18 +996,13 @@ function renderValueInput(item) {
             container.innerHTML = \`
                 <label>变量值</label>
                 <textarea id="text-value" placeholder="格式：剧名:秒 或 剧名/S01:秒 或 剧名@来源:秒 或 剧名/S01/E01@来源%:秒" rows="\${rows}" class="text-monospace">\${value}</textarea>
-                <div style="margin-top: 8px; display: flex; gap: 10px;">
+                <div style="margin-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
                     <button type="button" class="btn btn-primary btn-sm" id="offset-rule-toggle" onclick="toggleOffsetRulePanel()">
-                        添加规则
+                        \${uiIcon('plus')} 添加规则
                     </button>
-                    <button type="button" class="btn btn-primary btn-sm" onclick="fetchAndShowRecentData()">
-                        \${uiIcon('bar-chart')} 查看最近数据
-                    </button>
+                    \${renderRecentDataButton()}
                 </div>
-                <div id="recent-data-panel" class="recent-data-panel">
-                    <div class="form-help" style="margin: 0 0 8px 0;">点击下方按钮可快捷填入规则表单：</div>
-                    <div id="recent-data-list"></div>
-                </div>
+                \${renderRecentDataPanel('点击下方按钮可快捷填入规则表单：')}
                 <div id="offset-rule-panel" class="offset-rule-panel">
                     <div class="form-help" style="margin: 0 0 8px 0;">季和集不填则对所有季/集生效</div>
                     <div class="offset-form-row">
@@ -1055,6 +1066,25 @@ function renderValueInput(item) {
                     </div>
                 </div>
             \`;
+        } else if (isDandanplayPassword) {
+            // 弹弹play密码专用编辑界面
+            container.innerHTML = \`
+                <div class="dandanplay-editor">
+                    <label>弹弹play密码</label>
+                    <textarea class="form-group" id="text-value" placeholder="请输入弹弹play密码" rows="3">\${value}</textarea>
+                    <div class="form-help">账号在 DANDANPLAY_ACCOUNT 中配置，两者同时填写后 dandan 源经 NipaPlay 中转弹弹play服务端获取弹幕</div>
+
+                    <div class="dandanplay-status" id="dandanplay-status">
+                        <span class="dandanplay-status-icon">\${uiIcon('search')}</span>
+                        <span class="dandanplay-status-text">点击下方按钮测试连通性</span>
+                    </div>
+                    <div class="dandanplay-actions" style="margin-bottom: 15px;">
+                        <button type="button" class="btn btn-primary btn-sm" id="dandanplay-verify-btn" onclick="verifyDandanplayConnection()">
+                            \${uiIcon('flask')} 测试连通性
+                        </button>
+                    </div>
+                </div>
+            \`;
         } else if (isBilibiliCookie) {
             // Bilibili Cookie 专用编辑界面
             const rows = value && value.length > 50 ? Math.min(Math.max(Math.ceil(value.length / 50), 3), 8) : 3;
@@ -1098,18 +1128,13 @@ function renderValueInput(item) {
             container.innerHTML = \`
                 <label>变量值</label>
                 <textarea id="text-value" placeholder="格式：副源 -> 主源 | 路由规则 或 副源 × 主源" rows="\${rows}" class="text-monospace">\${value || ''}</textarea>
-                <div style="margin-top: 8px; display: flex; gap: 10px;">
+                <div style="margin-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
                     <button type="button" class="btn btn-primary btn-sm" id="merge-rule-toggle" onclick="toggleMergeRulePanel()">
-                        添加规则
+                        \${uiIcon('plus')} 添加规则
                     </button>
-                    <button type="button" class="btn btn-primary btn-sm" onclick="fetchAndShowRecentData()">
-                        \${uiIcon('bar-chart')} 查看最近数据
-                    </button>
+                    \${renderRecentDataButton()}
                 </div>
-                <div id="recent-data-panel" class="recent-data-panel">
-                    <div class="form-help" style="margin: 0 0 8px 0;">点击下方按钮可快捷填入规则表单：</div>
-                    <div id="recent-data-list"></div>
-                </div>
+                \${renderRecentDataPanel('点击下方按钮可快捷填入规则表单：')}
                 <div id="merge-rule-panel" class="offset-rule-panel">
                     <div class="offset-form-row">
                         <div style="flex: 1; min-width: 120px;">
@@ -1153,11 +1178,13 @@ function renderValueInput(item) {
             container.innerHTML = \`
                 <label>变量值 *</label>
                 <textarea id="text-value" placeholder="例如: localhost" rows="\${rows}" class="text-monospace">\${value}</textarea>
+                \${recentDataBlock}
             \`;
         } else {
             container.innerHTML = \`
                 <label>变量值 *</label>
                 <input type="text" id="text-value" placeholder="例如: localhost" value="\${value}" required>
+                \${recentDataBlock}
             \`; 
         }
     }
@@ -1422,7 +1449,7 @@ function toggleOffsetRulePanel() {
         const isHidden = getComputedStyle(panel).display === 'none';
         panel.style.display = isHidden ? 'block' : 'none';
         const btn = document.getElementById('offset-rule-toggle');
-        if (btn) btn.textContent = isHidden ? '收起' : '添加规则';
+        if (btn) btn.innerHTML = isHidden ? uiIcon('chevron-up') + ' 收起' : uiIcon('plus') + ' 添加规则';
     }
 }
 
@@ -1524,7 +1551,7 @@ function toggleMergeRulePanel() {
         const isHidden = getComputedStyle(panel).display === 'none';
         panel.style.display = isHidden ? 'block' : 'none';
         const btn = document.getElementById('merge-rule-toggle');
-        if (btn) btn.textContent = isHidden ? '收起' : '添加规则';
+        if (btn) btn.innerHTML = isHidden ? uiIcon('chevron-up') + ' 收起' : uiIcon('plus') + ' 添加规则';
     }
 }
 
@@ -1651,9 +1678,8 @@ function updateTagStates() {
 
         if (isMergeMode) {
             // [合并模式逻辑]
-            // SOURCE_ORDER / PLATFORM_ORDER 中已经添加过的源不能再次加入。
-            // MERGE_SOURCE_PAIRS 保留同一源参与不同合并组的能力。
-            if (stagingTokens.has(value) || (preventDuplicateSources && selectedSourceTokens.has(value))) {
+            // 仅禁止同一合并组内重复：已选项需保持可选取，才能把已选源组合成合并组。
+            if (stagingTokens.has(value)) {
                 shouldDisable = true;
             }
         } else {
@@ -1755,12 +1781,12 @@ function toggleMergeMode() {
 
     if (isMergeMode) {
         btn.classList.add('active');
-        btn.innerHTML = uiIcon('unlink') + ' 合并模式已开启，点击关闭';
+        btn.innerHTML = uiIcon('unlink') + ' 合并模式';
         stagingArea.classList.add('active');
         renderStagingArea();
     } else {
         btn.classList.remove('active');
-        btn.innerHTML = uiIcon('link') + ' 点击开启合并模式';
+        btn.innerHTML = uiIcon('link') + ' 合并模式';
         stagingArea.classList.remove('active');
         stagingTags = [];
     }
@@ -2546,15 +2572,20 @@ function deleteEnv(category, index, deleteButton) {
             deleteButton.disabled = true;
 
             // 调用API删除环境变量
-            fetch(buildApiUrl('/api/env/del'), {
+            fetch(buildApiUrl('/api/env/del', true), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({ key })
             })
-            .then(response => response.json())
-            .then(result => {
+            .then(async response => ({ status: response.status, result: await response.json() }))
+            .then(({ status, result }) => {
+                if (isAdminAuthError(status, result)) {
+                    addLog(\`删除配置项失败: \${result.errorMessage || '需要有效的 ADMIN_TOKEN'}\`, 'error');
+                    alertAdminTokenRequired();
+                    return;
+                }
                 if (result.success) {
                     // 从本地数据中删除
                     envVariables[category].splice(index, 1);
@@ -2641,10 +2672,19 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
         itemData = { key, value, description, type };
     }
 
+    // 掩码值（预览星号）表示凭据未改动，跳过写入以免用星号覆盖服务端已存真实值
+    const isMasked = /^[*]+$/.test(value);
+
     // 调用API更新环境变量 - 先尝试set接口，失败则调用add接口
     try {
+        if (isMasked) {
+            // 凭据值未变更，保留服务端已存值，仅关闭编辑框
+            addLog(\`配置项 \${key} 未变更，已保留原值\`, 'info');
+            closeModal();
+            return;
+        }
         // 首先尝试使用set接口更新
-        let response = await fetch(buildApiUrl('/api/env/set'), {
+        let response = await fetch(buildApiUrl('/api/env/set', true), {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
@@ -2654,9 +2694,16 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
 
         let result = await response.json();
 
+        // 系统管理接口需要 ADMIN_TOKEN，鉴权失败时不再回落 add 接口
+        if (isAdminAuthError(response.status, result)) {
+            addLog(\`操作失败: \${result.errorMessage || '需要有效的 ADMIN_TOKEN'}\`, 'error');
+            alertAdminTokenRequired();
+            return;
+        }
+
         if (!result.success) {
             // 如果set接口失败，尝试使用add接口
-            response = await fetch(buildApiUrl('/api/env/add'), {
+            response = await fetch(buildApiUrl('/api/env/add', true), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -2665,6 +2712,12 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
             });
 
             result = await response.json();
+
+            if (isAdminAuthError(response.status, result)) {
+                addLog(\`操作失败: \${result.errorMessage || '需要有效的 ADMIN_TOKEN'}\`, 'error');
+                alertAdminTokenRequired();
+                return;
+            }
         }
 
         if (result.success) {
@@ -2980,6 +3033,22 @@ function showBilibiliCookieSaveHint(text) {
 }
 
 /* ========================================
+   连通性测试取值
+   ======================================== */
+
+// 读取配置列表中某项的当前值，供连通性测试随请求提交；掩码（当前访问无权限读取明文）返回空串，由服务端回退到已保存配置
+function readLocalEnvValue(key) {
+    for (const items of Object.values(envVariables)) {
+        const item = items.find(entry => entry.key === key);
+        if (item && typeof item.value === 'string') {
+            const value = item.value.trim();
+            return /^[*]+$/.test(value) ? '' : value;
+        }
+    }
+    return '';
+}
+
+/* ========================================
    AI API Key 连通性测试功能
    ======================================== */
 async function verifyAiConnection() {
@@ -3004,14 +3073,19 @@ async function verifyAiConnection() {
     
     statusEl.innerHTML = \`<span class="ai-status-icon">\${uiIcon('search')}</span><span class="ai-status-text">正在测试连通性...</span>\`;
     
-    // 检查是否为脱敏后的 *...* 
+    // 地址与模型始终随请求提交，避免云部署下因未重新部署而取不到新配置；密钥为脱敏值时省略该字段，由服务端使用已保存的密钥
     const isMasked = /^[*]+$/.test(apiKey);
+    const payload = {
+        aiBaseUrl: readLocalEnvValue('AI_BASE_URL'),
+        aiModel: readLocalEnvValue('AI_MODEL')
+    };
+    if (!isMasked) payload.aiApiKey = apiKey;
     
     try {
         const response = await fetch(buildApiUrl('/api/ai/verify', true), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(isMasked ? {} : { 'aiApiKey': apiKey })
+            body: JSON.stringify(payload)
         });
         
         const result = await response.json();
@@ -3025,6 +3099,62 @@ async function verifyAiConnection() {
         }
     } catch (error) {
         statusEl.innerHTML = \`<span class="ai-status-icon">\${uiIcon('alert-triangle')}</span><span class="ai-status-text">测试请求失败: \${error.message}</span>\`;
+        statusEl.style.color = 'var(--warning-color, #ffc107)';
+    } finally {
+        // 恢复按钮状态
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+    }
+}
+
+/* ========================================
+   弹弹play密码连通性测试功能
+   ======================================== */
+async function verifyDandanplayConnection() {
+    const statusEl = document.getElementById('dandanplay-status');
+    const btn = document.getElementById('dandanplay-verify-btn');
+    const passwordInput = document.getElementById('text-value');
+
+    if (!statusEl || !passwordInput) return;
+
+    const password = passwordInput.value.trim();
+
+    // 如果输入框为空，提示未配置
+    if (!password) {
+        statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('alert-triangle')}</span><span class="dandanplay-status-text">请先输入弹弹play密码</span>\`;
+        return;
+    }
+
+    // 设置按钮为加载状态
+    const originalText = btn.innerHTML;
+    btn.innerHTML = '<span class="loading-spinner-small"></span>';
+    btn.disabled = true;
+
+    statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('search')}</span><span class="dandanplay-status-text">正在测试连通性...</span>\`;
+
+    // 账号始终随请求提交，避免云部署下因未重新部署而取不到新账号；密码为脱敏值时省略该字段，由服务端使用已保存的密码
+    const isMasked = /^[*]+$/.test(password);
+    const payload = { dandanplayAccount: readLocalEnvValue('DANDANPLAY_ACCOUNT') };
+    if (!isMasked) payload.dandanplayPassword = password;
+
+    try {
+        const response = await fetch(buildApiUrl('/api/nipaplay/verify', true), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        const result = await response.json();
+
+        if (result.ok) {
+            statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('check-circle')}</span><span class="dandanplay-status-text">\${result.message || '弹弹play账号连通性测试成功'}</span>\`;
+            statusEl.style.color = 'var(--success-color, #28a745)';
+        } else {
+            statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('x-circle')}</span><span class="dandanplay-status-text">\${result.message || '连通性测试失败'}</span>\`;
+            statusEl.style.color = 'var(--danger-color, #dc3545)';
+        }
+    } catch (error) {
+        statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('alert-triangle')}</span><span class="dandanplay-status-text">测试请求失败: \${error.message}</span>\`;
         statusEl.style.color = 'var(--warning-color, #ffc107)';
     } finally {
         // 恢复按钮状态
@@ -3081,6 +3211,21 @@ function toggleMapping(btnEl) {
 const RECENT_DATA_PAGE_SIZE = 5;
 let recentAnimeCacheData = []; // 最近数据完整缓存
 let recentAnimeDisplayedCount = 0; // 最近数据已显示条数
+
+// 查看最近数据按钮：各配置页共用；className 用于与同行操作按钮保持同一尺寸
+function renderRecentDataButton(className = 'btn btn-primary btn-sm') {
+    return \`<button type="button" class="\${className}" onclick="fetchAndShowRecentData()">\${uiIcon('bar-chart')} 查看最近数据</button>\`;
+}
+
+// 查看最近数据折叠面板：hint 传入时作为面板内的提示文案
+function renderRecentDataPanel(hint) {
+    return \`
+        <div id="recent-data-panel" class="recent-data-panel">
+            \${hint ? \`<div class="form-help" style="margin: 0 0 8px 0;">\${hint}</div>\` : ''}
+            <div id="recent-data-list"></div>
+        </div>
+    \`;
+}
 
 // 快捷数据面板业务逻辑
 async function fetchAndShowRecentData() {
